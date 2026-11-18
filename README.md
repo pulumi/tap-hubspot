@@ -90,8 +90,11 @@ A Hubspot access token is required to make API requests. (See [Hubspot API](http
 | `forms` | Full Table | Forms of all types |
 | `form_submissions` | Incremental | Submissions of each form (child of `forms`) |
 | `contact_lists` | Full Table | Lists of all object types |
+| `list_memberships` | Incremental | Members of the static lists (child of `contact_lists`) |
 
 `email_events` and `subscription_changes` read one day at a time, from old to new, and save the bookmark after each day. They need a `start_date` or a bookmark. `form_submissions` keeps a bookmark per form and stops at the first page that reaches it. Submissions of `FACEBOOK_LEAD_AD`, `MEETING`, `DOCUMENT` and `BLOG_COMMENT` forms cannot be exported, so the tap does not request them.
+
+`list_memberships` reads the members of the `MANUAL` and `SNAPSHOT` lists. The members of a dynamic list follow from its filters, and a read of them can take many more requests. The stream keeps a bookmark per list and reads all members of a list again when `membershipsUpdatedAt` of the list (its last update, add or remove) is newer than the bookmark. The current members of a list are the rows with the `membershipsUpdatedAt` that `contact_lists` has for the list. The stream does not read empty lists.
 
 ### Permissions
 
@@ -123,7 +126,7 @@ The following scopes need to be added to your access token to access the followi
 - Email Subscriptions: `content`
 - Email Events, Subscription Changes, Campaign Ids, Campaigns: `content`
 - Forms, Form Submissions: `forms`
-- Contact Lists: `crm.lists.read`
+- Contact Lists, List Memberships: `crm.lists.read`
 - Properties: same scopes as the corresponding object type
 - Custom Objects: `crm.objects.custom.read` and `crm.schemas.custom.read` (HubSpot Enterprise only)
 

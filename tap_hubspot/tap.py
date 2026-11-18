@@ -143,6 +143,7 @@ class TapHubspot(Tap):
             marketing_streams.FormsStream(self),
             marketing_streams.FormSubmissionsStream(self),
             marketing_streams.ContactListsStream(self),
+            marketing_streams.ListMembershipsStream(self),
             *[
                 streams.CustomObjectStream(self, object_type)
                 for object_type in self.config.get("custom_object_types", [])

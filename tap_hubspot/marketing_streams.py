@@ -31,6 +31,9 @@ UNEXPORTABLE_FORM_TYPES = frozenset(
     {"FACEBOOK_LEAD_AD", "MEETING", "DOCUMENT", "BLOG_COMMENT"},
 )
 
+# Lists whose members change only when a person or a workflow adds or removes them.
+STATIC_LIST_TYPES = frozenset({"MANUAL", "SNAPSHOT"})
+
 
 def ms_to_iso(value: int | None) -> str | None:
     """Convert epoch milliseconds to an ISO 8601 UTC timestamp.
@@ -556,6 +559,11 @@ class ContactListsStream(HubspotStream):
         th.Property("createdById", th.StringType),
         th.Property("updatedById", th.StringType),
         th.Property("additionalProperties", th.ObjectType()),
+        th.Property(
+            "membershipsUpdatedAt",
+            th.DateTimeType,
+            description="Last change of the list or of its members",
+        ),
     ).to_dict()
 
     @override
@@ -587,3 +595,104 @@ class ContactListsStream(HubspotStream):
     ) -> t.Any:
         data = response.json()
         return data.get("offset") if data.get("hasMore") else None
+
+    @override
+    def post_process(self, row: Record, context: Context | None = None) -> Record:
+        props = row.get("additionalProperties") or {}
+        changes = [
+            int(props[key])
+            for key in ("hs_last_record_added_at", "hs_last_record_removed_at")
+            if props.get(key)
+        ]
+        updated_at = to_ms(datetime.datetime.fromisoformat(row["updatedAt"]))
+        row["membershipsUpdatedAt"] = ms_to_iso(max([updated_at, *changes]))
+        return row
+
+    @override
+    def generate_child_contexts(
+        self,
+        record: Record,
+        context: Context | None,
+    ) -> t.Iterable[Context | None]:
+        size = (record.get("additionalProperties") or {}).get("hs_list_size")
+        if record["processingType"] in STATIC_LIST_TYPES and size != "0":
+            yield {
+                "listId": record["listId"],
+                "membershipsUpdatedAt": record["membershipsUpdatedAt"],
+            }
+
+
+class ListMembershipsStream(HubspotStream):
+    """https://developers.hubspot.com/docs/api-reference/latest/crm/lists/memberships/get-memberships-by-id.
+
+    Members of the static lists (MANUAL and SNAPSHOT). The members of a dynamic list
+    follow from its filters, and a read of them can take many more requests.
+
+    The stream reads all members of a list again when the `membershipsUpdatedAt` of
+    the list is newer than the bookmark of the list. The current members of a list
+    are the rows with the `membershipsUpdatedAt` that `contact_lists` has for the
+    list. The stream does not read empty lists, so an empty list has no such rows.
+    """
+
+    name = "list_memberships"
+    parent_stream_type = ContactListsStream
+    path = "/{listId}/memberships"
+    primary_keys = ("listId", "membershipsUpdatedAt", "recordId")
+    replication_key = "membershipsUpdatedAt"
+    replication_method = REPLICATION_INCREMENTAL
+    is_sorted = False
+    # One bookmark for each list.
+    state_partitioning_keys = ("listId",)
+    records_jsonpath = "$.results[*]"
+
+    schema = th.PropertiesList(
+        th.Property("listId", th.StringType),
+        th.Property("recordId", th.StringType),
+        th.Property("membershipTimestamp", th.DateTimeType),
+        th.Property("membershipsUpdatedAt", th.DateTimeType),
+    ).to_dict()
+
+    @override
+    @property
+    def url_base(self) -> str:
+        return crm_url_base("lists")
+
+    @override
+    def get_url_params(
+        self,
+        context: Context | None,
+        next_page_token: t.Any,
+    ) -> dict[str, t.Any]:
+        # The API returns at most 250 members in a page.
+        params: dict[str, t.Any] = {"limit": 250}
+        if next_page_token:
+            params["after"] = next_page_token
+        return params
+
+    @override
+    def get_next_page_token(
+        self,
+        response: requests.Response,
+        previous_token: t.Any,
+    ) -> t.Any:
+        return response.json().get("paging", {}).get("next", {}).get("after")
+
+    @override
+    def request_records(self, context: Context | None) -> t.Iterable[dict]:
+        context = t.cast("Context", context)
+        # The bookmark from the state: the SDK raises the starting value to the
+        # start_date, which would skip the lists that did not change since then.
+        state = self.get_context_state(context)
+        bookmark = state.get("replication_key_value")
+        if bookmark is not None and context["membershipsUpdatedAt"] <= bookmark:
+            return
+        yield from super().request_records(context)
+        # All members of the list are processed when the generator resumes.
+        self.finalize_state_progress_markers(state)
+
+    @override
+    def post_process(self, row: Record, context: Context | None = None) -> Record:
+        context = t.cast("Context", context)
+        row["listId"] = context["listId"]
+        row["membershipsUpdatedAt"] = context["membershipsUpdatedAt"]
+        return row

@@ -22,6 +22,28 @@ T0 = 1794268800000
 LISTS_SEARCH_PATH = f"/crm/lists/{client.API_VERSION}/search"
 
 
+def make_list(
+    list_id: str,
+    processing_type: str = "MANUAL",
+    *,
+    updated_at: int = T0,
+    **properties: str,
+) -> dict:
+    """Return a list as the lists search returns it."""
+    return {
+        "listId": list_id,
+        "name": f"l{list_id}",
+        "processingType": processing_type,
+        "updatedAt": ms.ms_to_iso(updated_at),
+        "additionalProperties": properties,
+    }
+
+
+def memberships_path(list_id: str) -> str:
+    """Return the path of the memberships of a list."""
+    return f"/crm/lists/{client.API_VERSION}/{list_id}/memberships"
+
+
 class FakeHubSpot:
     """Answers the requests of the marketing streams and records each request."""
 
@@ -32,6 +54,8 @@ class FakeHubSpot:
         self.submissions: dict[str, list[dict]] = {}
         self.campaign_ids: list[int] = []
         self.lists: list[dict] = []
+        self.members: dict[str, list[str]] = {}
+        self.fail_on_list: str | None = None
         self.calls: list[tuple[str, dict]] = []
         self.fail_on_window_start: int | None = None
         self.page_size = 2
@@ -57,7 +81,7 @@ class FakeHubSpot:
         page = rows[offset : offset + self.page_size]
         return page, offset + self.page_size < len(rows)
 
-    def _route(self, path: str, query: dict) -> dict | list:
+    def _route(self, path: str, query: dict) -> dict | list:  # noqa: PLR0911
         offset = int(query.get("offset", 0))
         if path == "/email/public/v1/events":
             start, end = int(query["startTimestamp"]), int(query["endTimestamp"])
@@ -93,6 +117,18 @@ class FakeHubSpot:
         if path == LISTS_SEARCH_PATH:
             page, more = self._page(self.lists, offset)
             return {"lists": page, "hasMore": more, "offset": offset + len(page)}
+        if path.endswith("/memberships"):
+            list_id = path.split("/")[-2]
+            if list_id == self.fail_on_list:
+                raise requests.exceptions.ConnectionError("fake outage")  # noqa: EM101, TRY003
+            rows = [
+                {"recordId": r, "membershipTimestamp": ms.ms_to_iso(T0)}
+                for r in self.members[list_id]
+            ]
+            after = int(query.get("after", 0))
+            page, more = self._page(rows, after)
+            paging = {"next": {"after": str(after + len(page))}} if more else None
+            return {"results": page, **({"paging": paging} if paging else {})}
         raise AssertionError(path)
 
 
@@ -234,7 +270,7 @@ def test_campaigns_read_each_campaign_with_one_state_entry(fake: FakeHubSpot) ->
 
 def test_contact_lists_page_with_offset(fake: FakeHubSpot) -> None:
     """The lists search pages with the offset of the previous response."""
-    fake.lists = [{"listId": str(i), "name": f"l{i}"} for i in range(5)]
+    fake.lists = [make_list(str(i)) for i in range(5)]
 
     records, _ = run_tap([ms.ContactListsStream])
 
@@ -243,9 +279,81 @@ def test_contact_lists_page_with_offset(fake: FakeHubSpot) -> None:
     assert offsets == [0, 2, 4]
 
 
+def test_list_memberships_read_changed_static_lists(fake: FakeHubSpot) -> None:
+    """Only static lists that changed after their bookmark are read, in full."""
+    fake.lists = [
+        # Read before, and not changed since.
+        make_list("1", hs_last_record_added_at=str(T0 + DAY), hs_list_size="1"),
+        # Changed after its bookmark.
+        make_list("2", hs_last_record_removed_at=str(T0 + 2 * DAY), hs_list_size="3"),
+        make_list("3", "DYNAMIC", hs_list_size="5"),
+        # Not read before. Older than the start_date, and without add or remove times.
+        make_list("4", "SNAPSHOT", updated_at=T0 - 10 * DAY, hs_list_size="1"),
+        make_list("5", hs_last_record_removed_at=str(T0 + DAY), hs_list_size="0"),
+    ]
+    fake.members = {"2": ["a", "b", "c"], "4": ["d"]}
+    fake.fail_on_list = "4"
+    state = {
+        "bookmarks": {
+            "list_memberships": {
+                "partitions": [
+                    {
+                        "context": {"listId": list_id},
+                        "replication_key": "membershipsUpdatedAt",
+                        "replication_key_value": ms.ms_to_iso(T0 + DAY),
+                    }
+                    for list_id in ("1", "2")
+                ],
+            },
+        },
+    }
+
+    records, states = run_tap(
+        [ms.ContactListsStream, ms.ListMembershipsStream],
+        state=state,
+        expect_error=True,
+    )
+
+    members = [r["record"] for r in records if r["stream"] == "list_memberships"]
+    assert [(m["listId"], m["recordId"]) for m in members] == [
+        ("2", "a"),
+        ("2", "b"),
+        ("2", "c"),
+    ]
+    assert {m["membershipsUpdatedAt"] for m in members} == {ms.ms_to_iso(T0 + 2 * DAY)}
+    member_calls = [
+        (path, q.get("after")) for path, q in fake.calls if "/memberships" in path
+    ]
+    assert member_calls == [
+        (memberships_path("2"), None),
+        (memberships_path("2"), "2"),
+        (memberships_path("4"), None),
+    ]
+
+    # The failed sync kept the bookmark of list 2, so the next sync reads list 4 only.
+    fake.fail_on_list = None
+    fake.calls = []
+    records, states = run_tap(
+        [ms.ContactListsStream, ms.ListMembershipsStream],
+        state=states[-1],
+    )
+
+    members = [r["record"] for r in records if r["stream"] == "list_memberships"]
+    assert [(m["listId"], m["recordId"]) for m in members] == [("4", "d")]
+    assert [path for path, _ in fake.calls if "/memberships" in path] == [
+        memberships_path("4"),
+    ]
+    partitions = states[-1]["bookmarks"]["list_memberships"]["partitions"]
+    assert {p["context"]["listId"]: p["replication_key_value"] for p in partitions} == {
+        "1": ms.ms_to_iso(T0 + DAY),
+        "2": ms.ms_to_iso(T0 + 2 * DAY),
+        "4": ms.ms_to_iso(T0 - 10 * DAY),
+    }
+
+
 def test_sync_stops_below_daily_request_reserve(fake: FakeHubSpot) -> None:
     """The sync stops after the first response below the daily reserve."""
-    fake.lists = [{"listId": str(i), "name": f"l{i}"} for i in range(5)]
+    fake.lists = [make_list(str(i)) for i in range(5)]
     fake.daily_remaining = 999
 
     records, _ = run_tap(
