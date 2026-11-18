@@ -1,6 +1,6 @@
 [build-system]
 build-backend = "hatchling.build"
-requires = [ "hatch-vcs==0.5", "hatchling==1.32.0" ]
+requires = [ "hatch-vcs==0.5", "hatchling==1.33.0" ]
 
 [project]
 name = "meltano-tap-hubspot"
@@ -24,7 +24,7 @@ dynamic = [ "version" ]
 dependencies = [
   "backports-datetime-fromisoformat==2.0.3; python_full_version<'3.11'",
   "requests==2.34.2",
-  "singer-sdk~=0.54.4",
+  "singer-sdk~=0.54.9",
   "typing-extensions>=4.15.0 ; python_full_version < '3.12'",
 ]
 [[project.authors]]
